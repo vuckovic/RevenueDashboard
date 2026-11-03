@@ -1,6 +1,7 @@
-"""PostgreSQL access: two tables — invoices (raw rows as JSONB) and sync_runs (log)."""
+"""PostgreSQL access: invoices (raw rows as JSONB), sync_runs (log), wdar (Workday report, one column per field)."""
 import json
 import os
+import re
 
 import psycopg
 
@@ -21,7 +22,49 @@ CREATE TABLE IF NOT EXISTS sync_runs (
     rows        INTEGER,
     message     TEXT
 );
+-- WDAR: Workday report "DV_Customer Invoices", full refresh each sync.
+-- Report fields are added as TEXT columns automatically on load (see replace_wdar).
+CREATE TABLE IF NOT EXISTS wdar (
+    id          SERIAL PRIMARY KEY,
+    loaded_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 """
+
+
+def _col(name):
+    """Workday field name -> safe snake_case column name."""
+    c = re.sub(r"[^0-9a-z]+", "_", name.lower()).strip("_") or "field"
+    if c[0].isdigit() or c in ("id", "loaded_at"):
+        c = "f_" + c
+    return c[:63]
+
+
+def replace_wdar(rows):
+    """Replace the contents of WDAR with the report rows (list of dicts)."""
+    cols = {}
+    for r in rows:
+        for k in r:
+            if k not in cols:
+                c, n = _col(k), 2
+                while c in cols.values():
+                    c, n = f"{_col(k)[:60]}_{n}", n + 1
+                cols[k] = c
+    with connect() as c, c.transaction(), c.cursor() as cur:
+        cur.execute(SCHEMA)
+        for col in cols.values():
+            cur.execute(f'ALTER TABLE wdar ADD COLUMN IF NOT EXISTS "{col}" TEXT')
+        cur.execute("TRUNCATE wdar RESTART IDENTITY")
+        if not rows:
+            return 0
+        names = ", ".join(f'"{v}"' for v in cols.values())
+        marks = ", ".join(["%s"] * len(cols))
+        cur.executemany(
+            f"INSERT INTO wdar ({names}) VALUES ({marks})",
+            [[None if r.get(k) is None else
+              (json.dumps(r[k]) if isinstance(r[k], (dict, list)) else str(r[k]))
+              for k in cols] for r in rows],
+        )
+    return len(rows)
 
 
 def connect():

@@ -22,13 +22,19 @@ Fill in at least `PG_PASSWORD` (and the Workday values) in `.env` before the las
 ## Containers
 | Service | What it does |
 |---|---|
-| `db` | PostgreSQL 16 — tables `invoices` (raw rows as JSONB) and `sync_runs` (log) |
+| `db` | PostgreSQL 16 — tables `wdar` (full Workday report, one TEXT column per field), `invoices` (paid rows as JSONB) and `sync_runs` (log) |
 | `web` | FastAPI web UI + REST API (`/api/invoices`, `/api/runs`, `POST /api/sync/{workday|ubw|all}`) |
 | `worker` | Runs a full sync every `SYNC_INTERVAL_MINUTES` |
 
+## Load the Workday report into WDAR now
+```
+docker compose run --rm worker python sync.py workday
+```
+Each sync replaces the contents of `wdar` with the current report; new report fields become new columns automatically.
+
 ## Configuration
 All settings live in `.env` (see `.env.example`). Sources switch on when configured:
-- **Workday:** set `WORKDAY_REPORT_URL` + password. Optionally `WORKDAY_PAID_FIELD` / `WORKDAY_ID_FIELD` once you know the report's column names.
+- **Workday:** set `WORKDAY_REPORT_URL` (the RaaS URL from the report's *Actions → Web Service → View URLs* — not the browser `gateway.htmld` link) + password. Optionally `WORKDAY_PAID_FIELD` / `WORKDAY_ID_FIELD` once you know the report's column names.
 - **UBW:** placeholder in `app/connectors/ubw.py` — access method not decided yet.
 
 ## Credentials
