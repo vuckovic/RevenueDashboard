@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Revenue Dashboard v2</title>
+<style>
+ body{font-family:system-ui,sans-serif;margin:2rem auto;max-width:1000px;padding:0 1rem;color:#222}
+ table{border-collapse:collapse;width:100%;font-size:.9rem}th,td{border-bottom:1px solid #ddd;padding:.4rem;text-align:left;vertical-align:top}
+ .ok{color:#1a7f37}.error{color:#c62828}.running{color:#b26a00}
+ .cards{display:flex;gap:1rem;flex-wrap:wrap}.card{border:1px solid #ddd;border-radius:8px;padding:1rem;min-width:150px}
+ button,a.btn{padding:.5rem 1rem;border-radius:6px;border:1px solid #888;background:#fff;cursor:pointer;text-decoration:none;color:#222}
+</style></head><body>
+<h1>Revenue Dashboard v2</h1>
+<p>Enabled sources: {{ sources|join(", ") or "none — configure .env" }}</p>
+<div class="cards">
+ {% for s, n in counts.items() %}<div class="card"><b>{{ s }}</b><br>{{ n }} invoices</div>{% else %}<div class="card">No data yet</div>{% endfor %}
+</div>
+<p style="margin-top:1rem">
+ <form method="post" action="/sync" style="display:inline"><button>Run sync now</button></form>
+ <a class="btn" href="/export.xlsx">Download Excel</a>
+ <a class="btn" href="/docs">API docs</a>
+</p>
+<h2>Recent sync runs</h2>
+<table><tr><th>#</th><th>Source</th><th>Started</th><th>Status</th><th>Rows</th><th>Message</th></tr>
+{% for r in runs %}<tr><td>{{ r.id }}</td><td>{{ r.source }}</td><td>{{ r.started_at.strftime("%Y-%m-%d %H:%M") }}</td>
+<td class="{{ r.status }}">{{ r.status }}</td><td>{{ r.rows if r.rows is not none else "" }}</td><td>{{ (r.message or "")[:200] }}</td></tr>
+{% else %}<tr><td colspan="6">No runs yet</td></tr>{% endfor %}
+</table>
+</body></html>
