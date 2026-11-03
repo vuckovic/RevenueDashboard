@@ -110,11 +110,14 @@ def fetch():
 
 if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else "about"
+    print("UBW endpoint:", os.getenv("UBW_WS_URL"), "| client:", os.getenv("UBW_CLIENT"), flush=True)
     if cmd == "about":
-        print(about())
+        print("About:", about())
     elif cmd == "templates":
-        for t in templates(" ".join(sys.argv[2:])):
+        found = templates(" ".join(sys.argv[2:]))
+        for t in found:
             print(t)
+        print(len(found), "template(s) found")
     elif cmd == "columns":
         rows = fetch_report()
         print(len(rows), "rows; columns:", list(rows[0]) if rows else [])
