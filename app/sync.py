@@ -1,9 +1,8 @@
-"""One sync pass: pull from each enabled source -> Postgres -> Excel Online."""
+"""One sync pass: pull from each enabled source -> Postgres."""
 import os
 import traceback
 
 import db
-import excel
 from connectors import ubw, workday
 
 SOURCES = {"workday": workday.fetch, "ubw": ubw.fetch}
@@ -30,17 +29,6 @@ def run_source(name):
         raise
 
 
-def run_excel():
-    if os.getenv("EXCEL_ENABLED", "false").lower() != "true":
-        return
-    run_id = db.start_run("excel")
-    try:
-        n = excel.publish(db.all_invoices())
-        db.finish_run(run_id, "ok", n)
-    except Exception as e:
-        db.finish_run(run_id, "error", message=str(e))
-        raise
-
 
 def run_all():
     for s in enabled_sources():
@@ -48,7 +36,3 @@ def run_all():
             run_source(s)
         except Exception:
             pass
-    try:
-        run_excel()
-    except Exception:
-        pass

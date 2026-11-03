@@ -48,8 +48,6 @@ def trigger(source: str, bg: BackgroundTasks):
         bg.add_task(sync.run_all)
     elif source in sync.SOURCES:
         bg.add_task(sync.run_source, source)
-    elif source == "excel":
-        bg.add_task(sync.run_excel)
     else:
         raise HTTPException(404, "unknown source")
     return {"queued": source}
