@@ -64,7 +64,28 @@ def replace_wdar(rows):
               (json.dumps(r[k]) if isinstance(r[k], (dict, list)) else str(r[k]))
               for k in cols] for r in rows],
         )
+        cur.execute(WDAR_VIEW)
     return len(rows)
+
+
+def _num(c):
+    return (f"CASE WHEN replace({c}, ',', '') ~ '^-?[0-9]+(\\.[0-9]+)?$' "
+            f"THEN replace({c}, ',', '')::numeric(18,2) END AS {c}")
+
+
+def _date(c):
+    return (f"CASE WHEN {c} ~ '^\\d{{4}}-\\d{{2}}-\\d{{2}}' THEN left({c}, 10)::date "
+            f"WHEN {c} ~ '^\\d{{2}}/\\d{{2}}/\\d{{4}}$' THEN to_date({c}, 'MM/DD/YYYY') END AS {c}")
+
+
+# Typed view for Power BI: amounts -> numeric, dates -> date, everything else as-is.
+WDAR_VIEW = "CREATE OR REPLACE VIEW wdar_v AS SELECT " + ", ".join([
+    "id", "loaded_at", "company", "customer_id", "customer_name", "customer_contracts_group",
+    "invoice_number", "referenceid", "po_number", "memo", "currency",
+    "invoice_status", "payment_status", "payment_terms",
+    _date("invoice_date"), _date("due_date"),
+    _num("invoice_amount"), _num("inv_amount_usd"), _num("amount_due_lc"), _num("amount_due_usd"),
+]) + " FROM wdar"
 
 
 def connect():
