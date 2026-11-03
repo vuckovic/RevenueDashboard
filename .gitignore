@@ -1,0 +1,21 @@
+# Secrets — never commit credentials
+.env
+.env.*
+*.secret
+secrets/
+config.local.*
+*.pem
+*.key
+
+# Data exports (may contain customer invoice data)
+*.xlsx
+*.csv
+data/
+
+# OS / editor / Python
+.DS_Store
+__pycache__/
+*.pyc
+.venv/
+.vscode/
+.idea/
