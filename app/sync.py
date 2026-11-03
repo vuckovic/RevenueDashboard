@@ -22,7 +22,7 @@ def run_source(name):
     try:
         if name == "workday":
             report = workday.fetch_report()
-            db.replace_wdar(report)              # full report -> WDAR
+            print("wdar", db.replace_wdar(report), "rows (full report)", flush=True)
             rows = workday.paid_invoices(report)  # paid only -> invoices
         else:
             rows = SOURCES[name]()
@@ -48,4 +48,4 @@ if __name__ == "__main__":
     import sys
     db.init()
     for s in sys.argv[1:] or enabled_sources():
-        print(s, run_source(s), "rows")
+        print(s, run_source(s), "paid rows -> invoices")
