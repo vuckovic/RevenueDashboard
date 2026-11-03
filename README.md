@@ -11,9 +11,11 @@ UBW (todo) ───┘                                   │
 
 ## Run it (Docker Desktop)
 ```
-cp .env.example .env      # fill in passwords locally — never commit .env
+cp .env.example .env
+open -e .env
 docker compose up -d --build
 ```
+Fill in at least `PG_PASSWORD` (and the Workday values) in `.env` before the last command. `.env` is git-ignored — never commit it.
 - Web interface: http://localhost:8000  (API docs: http://localhost:8000/docs)
 - Logs: `docker compose logs -f worker`
 
