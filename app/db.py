@@ -1,4 +1,5 @@
-"""PostgreSQL access: invoices (raw rows as JSONB), sync_runs (log), wdar (Workday report, one column per field)."""
+"""PostgreSQL access: invoices (paid rows as JSONB), sync_runs (log),
+wdar (Workday report) and ubwar (UBW report) — one TEXT column per report field."""
 import json
 import os
 import re
@@ -28,7 +29,14 @@ CREATE TABLE IF NOT EXISTS wdar (
     id          SERIAL PRIMARY KEY,
     loaded_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+-- UBWAR: UBW browser template (UBW_TEMPLATE_ID), same pattern as WDAR.
+CREATE TABLE IF NOT EXISTS ubwar (
+    id          SERIAL PRIMARY KEY,
+    loaded_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 """
+
+REPORT_TABLES = ("wdar", "ubwar")
 
 
 def _col(name):
@@ -40,7 +48,12 @@ def _col(name):
 
 
 def replace_wdar(rows):
-    """Replace the contents of WDAR with the report rows (list of dicts)."""
+    return replace_report("wdar", rows)
+
+
+def replace_report(table, rows):
+    """Replace the contents of a report table (wdar/ubwar) with rows (list of dicts)."""
+    assert table in REPORT_TABLES
     cols = {}
     for r in rows:
         for k in r:
@@ -52,19 +65,20 @@ def replace_wdar(rows):
     with connect() as c, c.transaction(), c.cursor() as cur:
         cur.execute(SCHEMA)
         for col in cols.values():
-            cur.execute(f'ALTER TABLE wdar ADD COLUMN IF NOT EXISTS "{col}" TEXT')
-        cur.execute("TRUNCATE wdar RESTART IDENTITY")
+            cur.execute(f'ALTER TABLE {table} ADD COLUMN IF NOT EXISTS "{col}" TEXT')
+        cur.execute(f"TRUNCATE {table} RESTART IDENTITY")
         if not rows:
             return 0
         names = ", ".join(f'"{v}"' for v in cols.values())
         marks = ", ".join(["%s"] * len(cols))
         cur.executemany(
-            f"INSERT INTO wdar ({names}) VALUES ({marks})",
+            f"INSERT INTO {table} ({names}) VALUES ({marks})",
             [[None if r.get(k) is None else
               (json.dumps(r[k]) if isinstance(r[k], (dict, list)) else str(r[k]))
               for k in cols] for r in rows],
         )
-        cur.execute(WDAR_VIEW)
+        if table == "wdar":
+            cur.execute(WDAR_VIEW)
     return len(rows)
 
 

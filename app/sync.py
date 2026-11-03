@@ -12,7 +12,7 @@ def enabled_sources():
     out = []
     if os.getenv("WORKDAY_REPORT_URL"):
         out.append("workday")
-    if os.getenv("UBW_ENABLED", "false").lower() == "true":
+    if os.getenv("UBW_ENABLED", "false").lower() == "true" and os.getenv("UBW_TEMPLATE_ID"):
         out.append("ubw")
     return out
 
@@ -24,6 +24,10 @@ def run_source(name):
             report = workday.fetch_report()
             print("wdar", db.replace_wdar(report), "rows (full report)", flush=True)
             rows = workday.paid_invoices(report)  # paid only -> invoices
+        elif name == "ubw":
+            report = ubw.fetch_report()
+            print("ubwar", db.replace_report("ubwar", report), "rows (full report)", flush=True)
+            rows = ubw.paid_invoices(report)
         else:
             rows = SOURCES[name]()
         db.upsert_invoices(name, rows)
@@ -32,7 +36,6 @@ def run_source(name):
     except Exception as e:  # log and continue
         db.finish_run(run_id, "error", message=f"{e}\n{traceback.format_exc()}")
         raise
-
 
 
 def run_all():
