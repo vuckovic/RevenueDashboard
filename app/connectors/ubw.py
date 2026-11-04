@@ -195,4 +195,7 @@ if __name__ == "__main__":
                 st[r.get("status")] = st.get(r.get("status"), 0) + 1
             print("status counts:", st)
         else:
-            print("UBW response (first 1500 chars):", last_response[:1500])
+            # Show the response without the (long) xs:schema part.
+            import re as _re
+            body = _re.sub(r"<xs:schema.*?</xs:schema>", "<xs:schema/>", last_response, flags=_re.S)
+            print("UBW response without schema (first 3000 chars):", body[:3000])
