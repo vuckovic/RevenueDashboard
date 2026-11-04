@@ -94,6 +94,9 @@ def _overrides():
     return out
 
 
+_RESTRICTION = ("RestrictionType", "FromValue", "ToValue")
+
+
 def _criteria_xml(tid):
     """Template's own criteria with UBW_CRITERIA applied, as SOAP XML ('' if no overrides)."""
     ov = _overrides()
@@ -107,11 +110,13 @@ def _criteria_xml(tid):
             used.add(col)
             lo, hi = ov[col]
             if not lo and not hi:  # empty = remove the restriction entirely
-                fields = [(k, None if k in ("FromValue", "ToValue", "RestrictionType") else v)
-                          for k, v in fields]
+                fields = [(k, "" if k in _RESTRICTION else v) for k, v in fields]
             else:
                 fields = [(k, lo if k == "FromValue" else hi if k == "ToValue" else v)
                           for k, v in fields]
+        # UBW rejects nulls in the restriction fields ("Column 'Type' does not allow nulls"),
+        # so send those as empty strings; skip other empty fields.
+        fields = [(k, "" if v is None and k in _RESTRICTION else v) for k, v in fields]
         props.append("<q:SearchCriteriaProperties>" + "".join(
             f"<q:{k}>{escape(v)}</q:{k}>" for k, v in fields if v is not None
         ) + "</q:SearchCriteriaProperties>")
@@ -173,8 +178,10 @@ if __name__ == "__main__":
             print(t)
         print(len(found), "template(s) found")
     elif cmd == "criteria":
-        for p in criteria(int(os.environ["UBW_TEMPLATE_ID"])):
+        for i, p in enumerate(criteria(int(os.environ["UBW_TEMPLATE_ID"]))):
             d = {c.tag.rsplit("}", 1)[-1]: c.text for c in p}
+            if i == 0:
+                print("all fields:", d)
             print({k: d.get(k) for k in ("ColumnName", "Description", "RestrictionType",
                                         "FromValue", "ToValue", "DataType", "IsParameter")})
     elif cmd == "columns":
