@@ -156,6 +156,9 @@ def fetch_report():
                 walk(rec)
 
     walk(ds)
+    # Keep detail rows only (_section 'D'); drop subtotal/total rows UBW adds.
+    if any("_section" in r for r in rows):
+        rows = [r for r in rows if r.get("_section") == "D"]
     return rows
 
 
