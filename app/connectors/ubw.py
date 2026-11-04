@@ -5,7 +5,11 @@ Runs a saved UBW browser template (UBW_TEMPLATE_ID) and returns its rows.
 Helpers (run inside the container):
   python -m connectors.ubw about                 # connectivity check (no login)
   python -m connectors.ubw templates [text]      # list templates, find the AR template id
-  python -m connectors.ubw columns               # show the columns of UBW_TEMPLATE_ID
+  python -m connectors.ubw criteria              # show the filters of UBW_TEMPLATE_ID
+  python -m connectors.ubw columns               # show the columns (+3 sample rows)
+
+Filters can be overridden per run with UBW_CRITERIA, e.g. "status=; period=202401..202612"
+(empty value = no restriction).
 """
 import os
 import sys
@@ -72,10 +76,52 @@ def templates(text=""):
     return out
 
 
+def criteria(tid):
+    """The template's search criteria: list of SearchCriteriaProperties elements."""
+    root = _call("GetSearchCriteria",
+                 f"<q:templateId>{tid}</q:templateId><q:hideUnused>false</q:hideUnused>")
+    return [e for e in root.iter() if e.tag.rsplit("}", 1)[-1] == "SearchCriteriaProperties"]
+
+
+def _overrides():
+    """UBW_CRITERIA="col=value; col2=from..to; col3=" -> {col: (from, to)}. Empty = no restriction."""
+    out = {}
+    for part in filter(None, (p.strip() for p in os.getenv("UBW_CRITERIA", "").split(";"))):
+        col, _, val = part.partition("=")
+        lo, _, hi = val.partition("..")
+        out[col.strip().lower()] = (lo.strip(), hi.strip())
+    return out
+
+
+def _criteria_xml(tid):
+    """Template's own criteria with UBW_CRITERIA applied, as SOAP XML ('' if no overrides)."""
+    ov = _overrides()
+    if not ov:
+        return ""
+    props, used = [], set()
+    for p in criteria(tid):
+        fields = [(c.tag.rsplit("}", 1)[-1], c.text) for c in p]
+        col = (dict(fields).get("ColumnName") or "").lower()
+        if col in ov:
+            used.add(col)
+            lo, hi = ov[col]
+            fields = [(k, lo if k == "FromValue" else hi if k == "ToValue" else v) for k, v in fields]
+        props.append("<q:SearchCriteriaProperties>" + "".join(
+            f"<q:{k}>{escape(v)}</q:{k}>" for k, v in fields if v is not None
+        ) + "</q:SearchCriteriaProperties>")
+    missing = set(ov) - used
+    if missing:
+        raise ValueError(f"UBW_CRITERIA columns not in template {tid}: {sorted(missing)} "
+                         f"(see: python -m connectors.ubw criteria)")
+    return "<q:SearchCriteriaPropertiesList>" + "".join(props) + "</q:SearchCriteriaPropertiesList>"
+
+
 def fetch_report():
     """Run UBW_TEMPLATE_ID and return all rows as a list of dicts (column -> text)."""
     tid = int(os.environ["UBW_TEMPLATE_ID"])
-    root = _call("GetTemplateResultAsDataSet", f"<q:input><q:TemplateId>{tid}</q:TemplateId></q:input>")
+    # WCF expects members in alphabetical order: SearchCriteriaPropertiesList before TemplateId.
+    root = _call("GetTemplateResultAsDataSet",
+                 f"<q:input>{_criteria_xml(tid)}<q:TemplateId>{tid}</q:TemplateId></q:input>")
     code, err = _text(root, "ReturnCode"), _text(root, "Status")
     if code not in (None, "0"):
         raise RuntimeError(f"UBW template {tid}: ReturnCode {code}: {err}")
@@ -118,6 +164,13 @@ if __name__ == "__main__":
         for t in found:
             print(t)
         print(len(found), "template(s) found")
+    elif cmd == "criteria":
+        for p in criteria(int(os.environ["UBW_TEMPLATE_ID"])):
+            d = {c.tag.rsplit("}", 1)[-1]: c.text for c in p}
+            print({k: d.get(k) for k in ("ColumnName", "Description", "RestrictionType",
+                                        "FromValue", "ToValue", "DataType", "IsParameter")})
     elif cmd == "columns":
         rows = fetch_report()
         print(len(rows), "rows; columns:", list(rows[0]) if rows else [])
+        for r in rows[:3]:
+            print(r)
