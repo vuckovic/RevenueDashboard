@@ -24,7 +24,7 @@ Fill in at least `PG_PASSWORD` (and the Workday values) in `.env` before the las
 |---|---|
 | `db` | PostgreSQL 16 — views for Power BI: `wdar_v`, `ubwar_v` (same columns) and **`ar_invoices_v`** (both, with `source`); tables `wdar` (full Workday report), `ubwar` (full UBW report) — one TEXT column per field —, `invoices` (paid rows as JSONB) and `sync_runs` (log) |
 | `web` | FastAPI web UI + REST API (`/api/invoices`, `/api/runs`, `POST /api/sync/{workday|ubw|all}`) |
-| `worker` | Runs a full sync every `SYNC_INTERVAL_MINUTES` |
+| `worker` | Syncs every hour on the hour, 08:00–17:00 Europe/Belgrade (`SYNC_HOURS`, `SYNC_TZ`, `SYNC_WEEKDAYS_ONLY`) |
 
 ## Load the Workday report into WDAR now
 ```
@@ -45,6 +45,17 @@ docker compose run --rm worker python -m connectors.ubw columns
 docker compose run --rm worker python sync.py ubw
 ```
 4. Optionally set `UBW_PAID_FIELD` / `UBW_ID_FIELD` from the column list so only paid rows go to `invoices`.
+
+### How the UBW table is kept up to date (no duplicates)
+Each sync pulls the report and compares it with `ubwar`:
+- every row has a unique `row_key` (`UBW_KEY_FIELDS`: client, voucher type, voucher no, sequence no) — a unique index makes duplicates impossible;
+- a `row_hash` over the row (ignoring `UBW_HASH_IGNORE`, e.g. the daily-changing DSO) detects changes;
+- changes are logged in **`ubwar_changes`**: `new`, `changed` (e.g. status / rest amount), `closed` (no longer in the open-items report → shown as *Closed* with 0 due) and `reopened`;
+- then rows are updated in place. A pull with 0 rows is rejected so nothing is wrongly closed.
+
+```
+docker compose exec db psql -U postgres -d revenue -c "select * from ubwar_changes order by id desc limit 20;"
+```
 
 ### Current UBW setup
 Template **792** "AR: KPI DSO customer" (customer transactions, client X10). It currently returns **open items only**; for paid items ask a UBW user to save a copy of 792 with *all/historical* transactions, share it with the integration user, and change `UBW_TEMPLATE_ID`. `UBW_CRITERIA` can override template filters per run (e.g. `dim_2=; att_2_id=`).

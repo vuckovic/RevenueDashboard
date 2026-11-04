@@ -19,6 +19,7 @@ def enabled_sources():
 
 def run_source(name):
     run_id = db.start_run(name)
+    msg = None
     try:
         if name == "workday":
             report = workday.fetch_report()
@@ -26,12 +27,16 @@ def run_source(name):
             rows = workday.paid_invoices(report)  # paid only -> invoices
         elif name == "ubw":
             report = ubw.fetch_report()
-            print("ubwar", db.replace_report("ubwar", report), "rows (full report)", flush=True)
+            st = db.upsert_ubwar(report)  # incremental: change log + upsert by key
+            msg = ("ubwar: {rows} rows | new {new}, changed {changed}, closed {closed}, "
+                   "reopened {reopened}, duplicate keys in report {duplicates}"
+                   + (" (first load)" if st["first_load"] else "")).format(**st)
+            print(msg, flush=True)
             rows = ubw.paid_invoices(report)
         else:
             rows = SOURCES[name]()
         db.upsert_invoices(name, rows)
-        db.finish_run(run_id, "ok", len(rows))
+        db.finish_run(run_id, "ok", len(rows), msg)
         return len(rows)
     except Exception as e:  # log and continue
         db.finish_run(run_id, "error", message=f"{e}\n{traceback.format_exc()}")
