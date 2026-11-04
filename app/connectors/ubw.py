@@ -21,6 +21,7 @@ import requests
 from connectors import paid_rows
 
 NS = "http://services.agresso.com/QueryEngineService/QueryEngineV201101"
+last_response = ""
 
 
 def _url():
@@ -105,7 +106,12 @@ def _criteria_xml(tid):
         if col in ov:
             used.add(col)
             lo, hi = ov[col]
-            fields = [(k, lo if k == "FromValue" else hi if k == "ToValue" else v) for k, v in fields]
+            if not lo and not hi:  # empty = remove the restriction entirely
+                fields = [(k, None if k in ("FromValue", "ToValue", "RestrictionType") else v)
+                          for k, v in fields]
+            else:
+                fields = [(k, lo if k == "FromValue" else hi if k == "ToValue" else v)
+                          for k, v in fields]
         props.append("<q:SearchCriteriaProperties>" + "".join(
             f"<q:{k}>{escape(v)}</q:{k}>" for k, v in fields if v is not None
         ) + "</q:SearchCriteriaProperties>")
@@ -125,6 +131,8 @@ def fetch_report():
     code, err = _text(root, "ReturnCode"), _text(root, "Status")
     if code not in (None, "0"):
         raise RuntimeError(f"UBW template {tid}: ReturnCode {code}: {err}")
+    global last_response
+    last_response = ET.tostring(root, encoding="unicode")
     result = _find(root, "TemplateResult")
     if result is None:
         raise RuntimeError("UBW: no TemplateResult in response")
@@ -174,3 +182,10 @@ if __name__ == "__main__":
         print(len(rows), "rows; columns:", list(rows[0]) if rows else [])
         for r in rows[:3]:
             print(r)
+        if rows:
+            st = {}
+            for r in rows:
+                st[r.get("status")] = st.get(r.get("status"), 0) + 1
+            print("status counts:", st)
+        else:
+            print("UBW response (first 1500 chars):", last_response[:1500])
