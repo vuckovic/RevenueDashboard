@@ -17,21 +17,26 @@ def enabled_sources():
     return out
 
 
+def _summary(table, st):
+    """e.g. 'wdar: 2752 rows | new 3, changed 5, removed 0, reopened 0, duplicate keys 0'"""
+    parts = ", ".join(f"{k} {v}" for k, v in st.items() if k not in ("rows", "first_load", "duplicates"))
+    msg = (f"{table}: {st['rows']} rows | {parts}, duplicate keys {st['duplicates']}"
+           + (" (first load)" if st["first_load"] else ""))
+    print(msg, flush=True)
+    return msg
+
+
 def run_source(name):
     run_id = db.start_run(name)
     msg = None
     try:
         if name == "workday":
             report = workday.fetch_report()
-            print("wdar", db.replace_wdar(report), "rows (full report)", flush=True)
+            msg = _summary("wdar", db.upsert_report("wdar", report))
             rows = workday.paid_invoices(report)  # paid only -> invoices
         elif name == "ubw":
             report = ubw.fetch_report()
-            st = db.upsert_ubwar(report)  # incremental: change log + upsert by key
-            msg = ("ubwar: {rows} rows | new {new}, changed {changed}, closed {closed}, "
-                   "reopened {reopened}, duplicate keys in report {duplicates}"
-                   + (" (first load)" if st["first_load"] else "")).format(**st)
-            print(msg, flush=True)
+            msg = _summary("ubwar", db.upsert_report("ubwar", report))
             rows = ubw.paid_invoices(report)
         else:
             rows = SOURCES[name]()

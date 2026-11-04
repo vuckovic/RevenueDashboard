@@ -30,7 +30,7 @@ Fill in at least `PG_PASSWORD` (and the Workday values) in `.env` before the las
 ```
 docker compose run --rm worker python sync.py workday
 ```
-Each sync replaces the contents of `wdar` with the current report; new report fields become new columns automatically.
+Each sync updates `wdar` in place (see below); new report fields become new columns automatically.
 
 ## Load the UBW report into UBWAR
 1. In `.env` set `UBW_USER`, `UBW_CLIENT` (company code), `UBW_PASSWORD`, and check `UBW_WS_URL` (web-services endpoint, not the `Default.aspx` link).
@@ -46,15 +46,15 @@ docker compose run --rm worker python sync.py ubw
 ```
 4. Optionally set `UBW_PAID_FIELD` / `UBW_ID_FIELD` from the column list so only paid rows go to `invoices`.
 
-### How the UBW table is kept up to date (no duplicates)
-Each sync pulls the report and compares it with `ubwar`:
-- every row has a unique `row_key` (`UBW_KEY_FIELDS`: client, voucher type, voucher no, sequence no) — a unique index makes duplicates impossible;
-- a `row_hash` over the row (ignoring `UBW_HASH_IGNORE`, e.g. the daily-changing DSO) detects changes;
-- changes are logged in **`ubwar_changes`**: `new`, `changed` (e.g. status / rest amount), `closed` (no longer in the open-items report → shown as *Closed* with 0 due) and `reopened`;
-- then rows are updated in place. A pull with 0 rows is rejected so nothing is wrongly closed.
+### How the tables are kept up to date (both sources, no duplicates)
+Each hourly sync pulls the report and compares it with the stored table (`wdar` for Workday, `ubwar` for UBW):
+- every row has a unique `row_key` — Workday: `WORKDAY_ID_FIELD` (referenceID); UBW: `UBW_KEY_FIELDS` (client, voucher type, voucher no, sequence no). A unique index makes duplicates impossible;
+- a `row_hash` over the row detects changes (`WORKDAY_HASH_IGNORE` / `UBW_HASH_IGNORE` exclude fields that change daily, e.g. UBW DSO);
+- changes are logged in **`report_changes`** (`source` = workday / ubw): `new`, `changed` (status, amount due, …), `removed` (Workday: no longer in the report – hidden from `wdar_v`) / `closed` (UBW: no longer an open item – shown as *Closed*, 0 due) and `reopened`;
+- then rows are updated in place. A pull with 0 rows is rejected so nothing is wrongly removed.
 
 ```
-docker compose exec db psql -U postgres -d revenue -c "select * from ubwar_changes order by id desc limit 20;"
+docker compose exec db psql -U postgres -d revenue -c "select * from report_changes order by id desc limit 20;"
 ```
 
 ### Current UBW setup
