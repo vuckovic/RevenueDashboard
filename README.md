@@ -22,7 +22,7 @@ Fill in at least `PG_PASSWORD` (and the Workday values) in `.env` before the las
 ## Containers
 | Service | What it does |
 |---|---|
-| `db` | PostgreSQL 16 — tables `wdar` (full Workday report), `ubwar` (full UBW report) — one TEXT column per field —, `invoices` (paid rows as JSONB) and `sync_runs` (log) |
+| `db` | PostgreSQL 16 — views for Power BI: `wdar_v`, `ubwar_v` (same columns) and **`ar_invoices_v`** (both, with `source`); tables `wdar` (full Workday report), `ubwar` (full UBW report) — one TEXT column per field —, `invoices` (paid rows as JSONB) and `sync_runs` (log) |
 | `web` | FastAPI web UI + REST API (`/api/invoices`, `/api/runs`, `POST /api/sync/{workday|ubw|all}`) |
 | `worker` | Runs a full sync every `SYNC_INTERVAL_MINUTES` |
 
@@ -45,6 +45,9 @@ docker compose run --rm worker python -m connectors.ubw columns
 docker compose run --rm worker python sync.py ubw
 ```
 4. Optionally set `UBW_PAID_FIELD` / `UBW_ID_FIELD` from the column list so only paid rows go to `invoices`.
+
+### Current UBW setup
+Template **792** "AR: KPI DSO customer" (customer transactions, client X10). It currently returns **open items only**; for paid items ask a UBW user to save a copy of 792 with *all/historical* transactions, share it with the integration user, and change `UBW_TEMPLATE_ID`. `UBW_CRITERIA` can override template filters per run (e.g. `dim_2=; att_2_id=`).
 
 ## Configuration
 All settings live in `.env` (see `.env.example`). Sources switch on when configured:

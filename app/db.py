@@ -77,19 +77,34 @@ def replace_report(table, rows):
               (json.dumps(r[k]) if isinstance(r[k], (dict, list)) else str(r[k]))
               for k in cols] for r in rows],
         )
-        if table == "wdar":
-            cur.execute(WDAR_VIEW)
+        _views(c, table)
     return len(rows)
 
 
-def _num(c):
+def _views(c, table):
+    """(Re)create the typed views; a view failure is logged, it doesn't fail the load."""
+    sql = {"wdar": WDAR_VIEW, "ubwar": UBWAR_VIEW}[table]
+    for name, stmt in ((f"{table}_v", sql), ("ar_invoices_v", AR_VIEW)):
+        if name == "ar_invoices_v" and not c.execute(
+                "SELECT to_regclass('wdar_v') IS NOT NULL AND to_regclass('ubwar_v') IS NOT NULL"
+        ).fetchone()[0]:
+            continue
+        try:
+            with c.transaction():
+                c.execute(stmt)
+        except Exception as e:
+            print(f"view {name} not created: {e}", flush=True)
+
+
+def _num(c, alias=None):
     return (f"CASE WHEN replace({c}, ',', '') ~ '^-?[0-9]+(\\.[0-9]+)?$' "
-            f"THEN replace({c}, ',', '')::numeric(18,2) END AS {c}")
+            f"THEN replace({c}, ',', '')::numeric(18,2) END AS {alias or c}")
 
 
-def _date(c):
+def _date(c, alias=None):
     return (f"CASE WHEN {c} ~ '^\\d{{4}}-\\d{{2}}-\\d{{2}}' THEN left({c}, 10)::date "
-            f"WHEN {c} ~ '^\\d{{2}}/\\d{{2}}/\\d{{4}}$' THEN to_date({c}, 'MM/DD/YYYY') END AS {c}")
+            f"WHEN {c} ~ '^\\d{{2}}/\\d{{2}}/\\d{{4}}$' THEN to_date({c}, 'MM/DD/YYYY') END "
+            f"AS {alias or c}")
 
 
 # Typed view for Power BI: amounts -> numeric, dates -> date, everything else as-is.
@@ -100,6 +115,26 @@ WDAR_VIEW = "CREATE OR REPLACE VIEW wdar_v AS SELECT " + ", ".join([
     _date("invoice_date"), _date("due_date"),
     _num("invoice_amount"), _num("inv_amount_usd"), _num("amount_due_lc"), _num("amount_due_usd"),
 ]) + " FROM wdar"
+
+# UBW (template 792, customer transactions) in the same shape as wdar_v.
+# Fields UBW doesn't have are NULL. Amounts are in invoice currency (cur_amount / rest_curr).
+UBWAR_VIEW = "CREATE OR REPLACE VIEW ubwar_v AS SELECT " + ", ".join([
+    "id", "loaded_at", "client AS company", "apar_id AS customer_id",
+    "NULL::text AS customer_name", "NULL::text AS customer_contracts_group",
+    "ext_inv_ref AS invoice_number", "voucher_no AS referenceid",
+    "NULL::text AS po_number", "NULL::text AS memo", "currency",
+    "voucher_type AS invoice_status",
+    "CASE WHEN rest_curr ~ '^-?0+(\\.0+)?$' THEN 'Paid' "
+    "WHEN rest_curr = cur_amount THEN 'Unpaid' ELSE 'Partially Paid' END AS payment_status",
+    "NULL::text AS payment_terms",
+    _date("voucher_date", "invoice_date"), _date("due_date"),
+    _num("cur_amount", "invoice_amount"), "NULL::numeric(18,2) AS inv_amount_usd",
+    _num("rest_curr", "amount_due_lc"), "NULL::numeric(18,2) AS amount_due_usd",
+]) + " FROM ubwar"
+
+# One AR view for Power BI: Workday + UBW, same columns, plus source.
+AR_VIEW = ("CREATE OR REPLACE VIEW ar_invoices_v AS "
+           "SELECT 'workday' AS source, * FROM wdar_v UNION ALL SELECT 'ubw' AS source, * FROM ubwar_v")
 
 
 def connect():
