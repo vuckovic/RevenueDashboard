@@ -108,7 +108,7 @@ function render(){
   // explain zero months: only issued (open) invoices are counted
   const last = D.items.reduce((m,i) => i.due_date > m ? i.due_date : m, '');
   $('chartNote').textContent = !D.items.length
-    ? 'No open invoices with an EUR rate — check FX_TO_EUR in .env (see note at the bottom).'
+    ? 'No open invoices with an EUR value — check the fx_rates table / FX_TO_EUR fallback in .env (see note at the bottom).'
     : ym(last) < keys[keys.length-1]
       ? `Latest due date of an open invoice: ${last}. Months after ${label(ym(last))} show 0 because those invoices haven't been issued yet.`
       : '';
@@ -164,9 +164,9 @@ function niceStep(raw){ const p = Math.pow(10, Math.floor(Math.log10(raw||1))); 
 function start(data){
   D = data;
   if (!D.companies.length) D.companies = [...new Set(D.items.map(i=>i.company))];
-  $('sub').textContent = `As of ${D.today} · ${D.items.length} open invoices · expected payment = due date · amounts in EUR (fixed rates)`;
+  $('sub').textContent = `As of ${D.today} · ${D.items.length} open invoices · expected payment = due date · amounts in EUR (ECB rates, converted in the database)`;
   const sk = Object.entries(D.skipped||{});
-  $('note').innerHTML = 'FX to EUR: ' + Object.entries(D.fx||{}).map(([k,v])=>`${esc(k)} ${v}`).join(', ') +
+  $('note').innerHTML = 'FX to EUR (1 unit = x EUR): ' + Object.entries(D.fx||{}).sort().map(([k,v])=>`${esc(k)} ${(+v).toFixed(4)}`).join(', ') +
     (sk.length ? ` · <span class="warn">Not included: ${sk.map(([k,v])=>`${v} × ${esc(k)}`).join(', ')}</span>` : '');
   render();
 }

@@ -59,6 +59,20 @@ Key fields (`WORKDAY_ID_FIELD`, `UBW_KEY_FIELDS`) are only used to match rows fo
 docker compose exec db psql -U postgres -d revenue -c "select * from report_changes order by id desc limit 20;"
 ```
 
+### EUR values and due months (both tables)
+Every refresh also fills, in the table itself: `fx_rate_eur`, `amount_eur` (invoice amount in EUR),
+`amount_due_eur` (open amount in EUR) and `due_month` (first day of the due date's month).
+Rates: ECB daily reference rates, stored in `fx_rates` and refreshed at the start of each sync
+(`FX_TO_EUR` in `.env` = fallback for currencies the ECB doesn't publish).
+The views add `expected_month` (month the open amount is expected: due month, overdue → current month)
+and `is_overdue`. Power BI: sum `amount_due_eur` by `expected_month` for expected income per month.
+The cash-flow dashboard uses the same EUR values.
+
+```
+docker compose exec db psql -U postgres -d revenue -c "select expected_month, source, sum(amount_due_eur) from ar_invoices_v where expected_month is not null group by 1,2 order by 1,2;"
+docker compose exec db psql -U postgres -d revenue -c "select * from fx_rates order by currency;"
+```
+
 ### Current UBW setup
 Template **915** (client X10). Check what a template returns with
 `python -m connectors.ubw profile` (row types, amounts, key uniqueness — no customer data).

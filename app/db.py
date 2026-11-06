@@ -36,6 +36,19 @@ ALTER TABLE wdar  ADD COLUMN IF NOT EXISTS row_key TEXT, ADD COLUMN IF NOT EXIST
                   ADD COLUMN IF NOT EXISTS first_seen TIMESTAMPTZ;
 ALTER TABLE ubwar ADD COLUMN IF NOT EXISTS row_key TEXT, ADD COLUMN IF NOT EXISTS row_hash TEXT,
                   ADD COLUMN IF NOT EXISTS first_seen TIMESTAMPTZ;
+-- EUR values + due month, filled on every refresh (see _enrich): one set of numbers in EUR.
+ALTER TABLE wdar  ADD COLUMN IF NOT EXISTS fx_rate_eur NUMERIC(18,8), ADD COLUMN IF NOT EXISTS amount_eur NUMERIC(18,2),
+                  ADD COLUMN IF NOT EXISTS amount_due_eur NUMERIC(18,2), ADD COLUMN IF NOT EXISTS due_month DATE;
+ALTER TABLE ubwar ADD COLUMN IF NOT EXISTS fx_rate_eur NUMERIC(18,8), ADD COLUMN IF NOT EXISTS amount_eur NUMERIC(18,2),
+                  ADD COLUMN IF NOT EXISTS amount_due_eur NUMERIC(18,2), ADD COLUMN IF NOT EXISTS due_month DATE;
+-- FX rates to EUR (1 unit of currency = rate_to_eur EUR), refreshed each sync from the ECB (fx.py).
+CREATE TABLE IF NOT EXISTS fx_rates (
+    currency    TEXT PRIMARY KEY,
+    rate_to_eur NUMERIC(18,8) NOT NULL,
+    rate_date   DATE,
+    source      TEXT NOT NULL,      -- ECB | FX_TO_EUR (.env fallback) | EUR
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 -- Change log for both sources: what changed between syncs.
 CREATE TABLE IF NOT EXISTS report_changes (
     id             SERIAL PRIMARY KEY,
@@ -65,25 +78,29 @@ END $$;
 # Per report table: source name, fields that identify a row (change log matching only),
 # fields ignored for change detection,
 # what a row dropping out of the report means, and which columns go into the change log
-# (invoice number, customer, status, amount due).
+# (invoice number, customer, status, amount due), and the columns used for EUR / due month
+# (currency, invoice amount, amount due, due date).
 REPORTS = {
     "wdar": dict(source="workday",
                  keys=lambda: os.getenv("WORKDAY_KEY_FIELDS") or os.getenv("WORKDAY_ID_FIELD") or "invoice_number",
                  ignore=lambda: os.getenv("WORKDAY_HASH_IGNORE", ""),
                  gone="removed",
-                 log=("invoice_number", "customer_id", "payment_status", "amount_due_lc")),
+                 log=("invoice_number", "customer_id", "payment_status", "amount_due_lc"),
+                 eur=("currency", "invoice_amount", "amount_due_lc", "due_date")),
     "ubwar": dict(source="ubw",
                   keys=lambda: os.getenv("UBW_KEY_FIELDS", "client,voucher_type,voucher_no,sequence_no"),
                   ignore=lambda: os.getenv("UBW_HASH_IGNORE", "f0_dso"),
                   gone="closed",
-                  log=("ext_inv_ref", "apar_id", "status", "rest_curr")),
+                  log=("ext_inv_ref", "apar_id", "status", "rest_curr"),
+                  eur=("currency", "cur_amount", "rest_curr", "due_date")),
 }
 
 
 def _col(name):
     """Report field name -> safe snake_case column name."""
     c = re.sub(r"[^0-9a-z]+", "_", name.lower()).strip("_") or "field"
-    if c[0].isdigit() or c in ("id", "loaded_at", "row_key", "row_hash", "first_seen", "closed_at"):
+    if c[0].isdigit() or c in ("id", "loaded_at", "row_key", "row_hash", "first_seen", "closed_at",
+                               "fx_rate_eur", "amount_eur", "amount_due_eur", "due_month"):
         c = "f_" + c
     return c[:63]
 
@@ -192,12 +209,39 @@ def refresh_report(table, rows):
             INSERT INTO {table} (row_key, row_hash, first_seen, loaded_at, {names})
             SELECT s.row_key, s.row_hash, coalesce(p.first_seen, now()), now(), {exprs}
             FROM {stage} s LEFT JOIN {prev} p USING (row_key)""")
+        no_fx = _enrich(c, table, set(cols.values()))
 
         stats = dict(c.execute("SELECT change, count(*) FROM report_changes "
                                "WHERE source = %s AND changed_at = now() GROUP BY change", (src,)).fetchall())
         _views(c)
-    return {"rows": len(staged), "duplicates": duplicates, "first_load": first_load,
-            **{k: stats.get(k, 0) for k in ("new", "changed", cfg["gone"])}}
+    out = {"rows": len(staged), "duplicates": duplicates, "first_load": first_load,
+           **{k: stats.get(k, 0) for k in ("new", "changed", cfg["gone"])}}
+    if no_fx:
+        out["no FX rate (EUR empty)"] = no_fx
+    return out
+
+
+def _enrich(c, table, have):
+    """Fill fx_rate_eur, amount_eur, amount_due_eur and due_month for the freshly loaded rows.
+    Returns e.g. 'XYZ (12 rows)' for currencies without a rate in fx_rates."""
+    cur, amt, due, dd = REPORTS[table]["eur"]
+    sets = []
+    if dd in have:
+        sets.append(f"due_month = date_trunc('month', {_date(dd)})::date")
+    if cur in have:
+        sets.append("fx_rate_eur = (SELECT f.rate_to_eur FROM fx_rates f "
+                    f"WHERE f.currency = upper(trim(t.{cur})))")
+    if sets:
+        c.execute(f"UPDATE {table} t SET " + ", ".join(sets))
+    sets = [f"{target} = round(({_num(src)}) * fx_rate_eur, 2)"
+            for target, src in (("amount_eur", amt), ("amount_due_eur", due)) if src in have]
+    if sets and cur in have:
+        c.execute(f"UPDATE {table} SET " + ", ".join(sets))
+    if cur not in have:
+        return "no currency column"
+    missing = c.execute(f"""SELECT coalesce(nullif(trim({cur}), ''), '(blank)'), count(*) FROM {table}
+                            WHERE fx_rate_eur IS NULL GROUP BY 1 ORDER BY 1""").fetchall()
+    return ", ".join(f"{k} ({n} rows)" for k, n in missing)
 
 
 def _views(c):
@@ -255,8 +299,21 @@ _AR_COLS = [("company", "text"), ("customer_id", "text"), ("customer_name", "tex
             ("amount_due_lc", "num"), ("amount_due_usd", "num")]
 
 
+def _eur_tail(have, table):
+    """EUR + month columns, identical in both views:
+    expected_month = month the open amount is expected (due month; overdue -> current month)."""
+    _, _, due, dd = REPORTS[table]["eur"]
+    due_x = _num(due) if due in have else "NULL::numeric"
+    dd_x = _date(dd) if dd in have else "NULL::date"
+    return (", fx_rate_eur, amount_eur, amount_due_eur, due_month, "
+            f"CASE WHEN {due_x} > 0 AND due_month IS NOT NULL "
+            "THEN greatest(due_month, date_trunc('month', current_date)::date) END AS expected_month, "
+            f"coalesce({dd_x} < current_date AND {due_x} > 0, false) AS is_overdue")
+
+
 def _wdar_view(have):
-    return "id, loaded_at, first_seen, " + _select(have, [(n, n, k) for n, k in _AR_COLS])
+    return ("id, loaded_at, first_seen, " + _select(have, [(n, n, k) for n, k in _AR_COLS])
+            + _eur_tail(have, "wdar"))
 
 
 # UBW column for each Power BI column (None = UBW has no equivalent).
@@ -274,7 +331,7 @@ def _ubwar_view(have):
                           f"CASE WHEN {_num('rest_curr')} = 0 THEN 'Paid' "
                           f"WHEN {_num('rest_curr')} = {_num('cur_amount')} THEN 'Unpaid' "
                           "ELSE 'Partially Paid' END AS payment_status")
-    return "id, loaded_at, first_seen, " + sel
+    return "id, loaded_at, first_seen, " + sel + _eur_tail(have, "ubwar")
 
 
 def connect():
@@ -339,7 +396,8 @@ def recent_runs(limit=20):
 def open_items():
     """Open AR rows (amount due > 0) from wdar_v and ubwar_v, whichever exist."""
     cols = ("invoice_number, referenceid, customer_id, customer_name, currency, payment_status, "
-            "due_date, amount_due_lc, amount_due_usd")
+            "due_date, amount_due_lc, amount_due_usd, fx_rate_eur, amount_due_eur, due_month, "
+            "expected_month, is_overdue")
     with connect() as c:
         parts = [f"SELECT '{src}' AS source, {cols} FROM {view} WHERE amount_due_lc > 0"
                  for src, view in (("workday", "wdar_v"), ("ubw", "ubwar_v"))

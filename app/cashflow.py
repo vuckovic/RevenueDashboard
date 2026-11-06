@@ -1,14 +1,15 @@
 """Cash-flow forecast: open AR items (amount due > 0) with expected payment date = due date,
-per company, converted to EUR with fixed rates from .env.
+per company, in EUR. EUR values come from the database (amount_due_eur, converted on every
+sync with ECB rates - see fx.py), so the dashboard and Power BI show the same numbers.
 
   CASHFLOW_COMPANIES=workday=Optiva,ubw=Qvantel   source -> company shown on the dashboard
-  FX_TO_EUR=USD=0.92,SEK=0.087,GBP=1.17            1 unit of currency = x EUR (EUR is always 1)
 """
 import os
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import db
+import fx
 
 
 def _pairs(s):
@@ -26,18 +27,8 @@ def companies():
             _pairs(os.getenv("CASHFLOW_COMPANIES", "workday=Optiva,ubw=Qvantel")).items()}
 
 
-def fx_rates():
-    rates = {"EUR": 1.0}
-    for k, v in _pairs(os.getenv("FX_TO_EUR", "")).items():
-        try:
-            rates[k.upper()] = float(v)
-        except ValueError:
-            pass
-    return rates
-
-
 def forecast():
-    comp, fx = companies(), fx_rates()
+    comp = companies()
     items, skipped = [], {}
 
     def skip(reason):
@@ -48,13 +39,10 @@ def forecast():
             skip("no due date")
             continue
         cur = (r["currency"] or "").strip().upper()
-        if cur in fx:
-            eur = float(r["amount_due_lc"]) * fx[cur]
-        elif r["amount_due_usd"] is not None and "USD" in fx:  # Workday also has a USD amount
-            eur = float(r["amount_due_usd"]) * fx["USD"]
-        else:
+        if r["amount_due_eur"] is None:
             skip(f"no FX rate for {cur or 'blank currency'}")
             continue
+        eur = float(r["amount_due_eur"])
         items.append({
             "company": comp.get(r["source"], r["source"]),
             "invoice": r["invoice_number"] or r["referenceid"],
@@ -70,4 +58,4 @@ def forecast():
     order = list(dict.fromkeys(comp.values()))
     order += sorted({i["company"] for i in items} - set(order))
     return {"currency": "EUR", "today": today.isoformat(), "companies": order,
-            "fx": fx, "skipped": skipped, "items": items}
+            "fx": fx.rates(), "skipped": skipped, "items": items}

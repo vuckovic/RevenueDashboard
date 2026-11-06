@@ -3,6 +3,7 @@ import os
 import traceback
 
 import db
+import fx
 from connectors import ubw, workday
 
 SOURCES = {"workday": workday.fetch, "ubw": ubw.fetch}
@@ -19,7 +20,7 @@ def enabled_sources():
 
 def _summary(table, st):
     """e.g. 'wdar: 2752 rows | new 3, changed 5, removed 0, duplicate keys 0'"""
-    parts = ", ".join(f"{k} {v}" for k, v in st.items() if k not in ("rows", "first_load", "duplicates"))
+    parts = ", ".join(f"{k}: {v}" for k, v in st.items() if k not in ("rows", "first_load", "duplicates"))
     msg = (f"{table}: {st['rows']} rows | {parts}, duplicate keys {st['duplicates']}"
            + (" (first load)" if st["first_load"] else ""))
     print(msg, flush=True)
@@ -30,6 +31,7 @@ def run_source(name):
     run_id = db.start_run(name)
     msg = None
     try:
+        fx.refresh()  # EUR rates first, so the refresh below can convert
         if name == "workday":
             report = workday.fetch_report()
             msg = _summary("wdar", db.refresh_report("wdar", report))
