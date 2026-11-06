@@ -7,6 +7,7 @@ Helpers (run inside the container):
   python -m connectors.ubw templates [text]      # list templates, find the AR template id
   python -m connectors.ubw criteria              # show the filters of UBW_TEMPLATE_ID
   python -m connectors.ubw columns               # show the columns (+3 sample rows)
+  python -m connectors.ubw profile               # row types, amounts, key uniqueness (no customer data)
 
 Filters can be overridden per run with UBW_CRITERIA, e.g. "status=; period=202401..202612"
 (empty value = no restriction).
@@ -187,6 +188,36 @@ if __name__ == "__main__":
                 print("all fields:", d)
             print({k: d.get(k) for k in ("ColumnName", "Description", "RestrictionType",
                                         "FromValue", "ToValue", "DataType", "IsParameter")})
+    elif cmd == "profile":
+        # Aggregates only (no customer data): what kind of rows the template returns.
+        from collections import Counter
+        rows = fetch_report()
+        print(len(rows), "rows")
+        for f in ("tab", "status", "voucher_type", "currency", "account", "pay_method"):
+            if rows and f in rows[0]:
+                print(f, dict(Counter(r.get(f) for r in rows).most_common(15)))
+        def num(v):
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                return None
+        amt = [num(r.get("cur_amount")) for r in rows]
+        rest = [num(r.get("rest_curr")) for r in rows]
+        print("cur_amount: positive", sum(1 for a in amt if a and a > 0),
+              "| negative", sum(1 for a in amt if a and a < 0),
+              "| zero/empty", sum(1 for a in amt if not a))
+        print("rest_curr: 0", sum(1 for x in rest if x == 0),
+              "| = cur_amount", sum(1 for a, x in zip(amt, rest) if a is not None and a == x),
+              "| other", sum(1 for a, x in zip(amt, rest) if x not in (0, None) and a != x))
+        per = sorted(r.get("period") for r in rows if r.get("period"))
+        if per:
+            print("period from", per[0], "to", per[-1])
+        for keys in (["ext_inv_ref"], ["voucher_no"], ["voucher_no", "sequence_no"],
+                     ["client", "voucher_type", "voucher_no", "sequence_no"],
+                     ["apar_id", "ext_inv_ref", "voucher_no", "sequence_no"]):
+            if rows and all(k in rows[0] for k in keys):
+                n = len({tuple(r.get(k) for k in keys) for r in rows})
+                print("unique", "+".join(keys), ":", n, "of", len(rows))
     elif cmd == "columns":
         rows = fetch_report()
         print(len(rows), "rows; columns:", list(rows[0]) if rows else [])

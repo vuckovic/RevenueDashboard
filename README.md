@@ -46,19 +46,23 @@ docker compose run --rm worker python sync.py ubw
 ```
 4. Optionally set `UBW_PAID_FIELD` / `UBW_ID_FIELD` from the column list so only paid rows go to `invoices`.
 
-### How the tables are kept up to date (both sources, no duplicates)
-Each hourly sync pulls the report and compares it with the stored table (`wdar` for Workday, `ubwar` for UBW):
-- every row has a unique `row_key` — Workday: `WORKDAY_ID_FIELD` (referenceID); UBW: `UBW_KEY_FIELDS` (client, voucher type, voucher no, sequence no). A unique index makes duplicates impossible;
-- a `row_hash` over the row detects changes (`WORKDAY_HASH_IGNORE` / `UBW_HASH_IGNORE` exclude fields that change daily, e.g. UBW DSO);
-- changes are logged in **`report_changes`** (`source` = workday / ubw): `new`, `changed` (status, amount due, …), `removed` (Workday: no longer in the report – hidden from `wdar_v`) / `closed` (UBW: no longer an open item – shown as *Closed*, 0 due) and `reopened`;
-- then rows are updated in place. A pull with 0 rows is rejected so nothing is wrongly removed.
+### How the tables are refreshed (both sources)
+Each hourly sync, in **one transaction**:
+1. compares the new report with the stored table and logs differences to **`report_changes`** (`new`, `changed` – status / amount due, `removed` (Workday) / `closed` (UBW));
+2. deletes all rows and inserts the new report — `wdar` / `ubwar` always match the source exactly (no duplicates, nothing left over);
+3. keeps `first_seen` (when a row first appeared) for rows that were already there; `loaded_at` = time of the last refresh.
+
+Power BI never sees a half-empty table, and if a pull fails or returns 0 rows the previous data stays.
+Key fields (`WORKDAY_ID_FIELD`, `UBW_KEY_FIELDS`) are only used to match rows for the change log.
 
 ```
 docker compose exec db psql -U postgres -d revenue -c "select * from report_changes order by id desc limit 20;"
 ```
 
 ### Current UBW setup
-Template **792** "AR: KPI DSO customer" (customer transactions, client X10). It currently returns **open items only**; for paid items ask a UBW user to save a copy of 792 with *all/historical* transactions, share it with the integration user, and change `UBW_TEMPLATE_ID`. `UBW_CRITERIA` can override template filters per run (e.g. `dim_2=; att_2_id=`).
+Template **915** (client X10). Check what a template returns with
+`python -m connectors.ubw profile` (row types, amounts, key uniqueness — no customer data).
+`UBW_CRITERIA` can override template filters per run (e.g. `dim_2=; att_2_id=`).
 
 ## Configuration
 All settings live in `.env` (see `.env.example`). Sources switch on when configured:

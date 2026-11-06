@@ -1,6 +1,6 @@
 """PostgreSQL access: invoices (paid rows as JSONB), sync_runs (log),
 wdar (Workday report) and ubwar (UBW report) — one TEXT column per report field,
-kept up to date incrementally with a change log (report_changes)."""
+replaced atomically each sync, with a change log (report_changes)."""
 import hashlib
 import json
 import os
@@ -25,23 +25,24 @@ CREATE TABLE IF NOT EXISTS sync_runs (
     rows        INTEGER,
     message     TEXT
 );
--- Report tables, incremental: one row per row_key, updated in place each sync
--- (see upsert_report). Report fields are added as TEXT columns automatically.
+-- Report tables: exact copy of the latest report, replaced atomically each sync
+-- (see refresh_report). Report fields are added as TEXT columns automatically.
+-- first_seen = when that row_key first appeared (carried over between syncs).
 --   wdar  = Workday report "DV_Customer Invoices"
 --   ubwar = UBW browser template UBW_TEMPLATE_ID
 CREATE TABLE IF NOT EXISTS wdar  (id SERIAL PRIMARY KEY, loaded_at TIMESTAMPTZ NOT NULL DEFAULT now());
 CREATE TABLE IF NOT EXISTS ubwar (id SERIAL PRIMARY KEY, loaded_at TIMESTAMPTZ NOT NULL DEFAULT now());
 ALTER TABLE wdar  ADD COLUMN IF NOT EXISTS row_key TEXT, ADD COLUMN IF NOT EXISTS row_hash TEXT,
-                  ADD COLUMN IF NOT EXISTS first_seen TIMESTAMPTZ, ADD COLUMN IF NOT EXISTS closed_at TIMESTAMPTZ;
+                  ADD COLUMN IF NOT EXISTS first_seen TIMESTAMPTZ;
 ALTER TABLE ubwar ADD COLUMN IF NOT EXISTS row_key TEXT, ADD COLUMN IF NOT EXISTS row_hash TEXT,
-                  ADD COLUMN IF NOT EXISTS first_seen TIMESTAMPTZ, ADD COLUMN IF NOT EXISTS closed_at TIMESTAMPTZ;
+                  ADD COLUMN IF NOT EXISTS first_seen TIMESTAMPTZ;
 -- Change log for both sources: what changed between syncs.
 CREATE TABLE IF NOT EXISTS report_changes (
     id             SERIAL PRIMARY KEY,
     source         TEXT NOT NULL,      -- workday | ubw
     changed_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
     row_key        TEXT NOT NULL,
-    change         TEXT NOT NULL,      -- new | changed | removed (workday) / closed (ubw) | reopened
+    change         TEXT NOT NULL,      -- new | changed | removed (workday) / closed (ubw)
     invoice_number TEXT,
     customer_id    TEXT,
     old_status     TEXT,
@@ -61,7 +62,8 @@ DO $$ BEGIN
 END $$;
 """
 
-# Per report table: source name, unique key fields, fields ignored for change detection,
+# Per report table: source name, fields that identify a row (change log matching only),
+# fields ignored for change detection,
 # what a row dropping out of the report means, and which columns go into the change log
 # (invoice number, customer, status, amount due).
 REPORTS = {
@@ -109,20 +111,23 @@ def _split(s):
     return [_col(k.strip()) for k in s.split(",") if k.strip()]
 
 
-def upsert_report(table, rows):
-    """Incremental load of a report table (wdar / ubwar) without duplicates.
+def refresh_report(table, rows):
+    """Replace a report table (wdar / ubwar) with the latest report - atomically.
 
-    Each row gets a row_key (key fields) and a row_hash (all fields except the ignored
-    ones and internal _fields). Then, in one transaction:
-      1. log new / changed / reopened rows to report_changes (vs. what is stored),
-      2. rows no longer in the report get closed_at (logged as removed/closed),
-      3. upsert by row_key (unique index) -> never a duplicate.
+    In ONE transaction (Power BI never sees a half-empty table; on any error the
+    previous data stays):
+      1. compare the new report with the stored one by row_key / row_hash and log
+         new / changed / removed rows to report_changes,
+      2. DELETE all rows and INSERT the new report (every row, exactly as UBW/Workday
+         returned it - the table always matches the source),
+      3. carry first_seen over for rows that were already there.
+    row_key is only used to compare; rows sharing a key are all kept (counted as
+    'duplicates' in the result, which then means the key fields are not unique).
     """
     cfg = REPORTS[table]
     src = cfg["source"]
     if not rows:
-        raise RuntimeError(f"{src}: report returned 0 rows - nothing updated "
-                           "(protects against marking everything removed)")
+        raise RuntimeError(f"{src}: report returned 0 rows - nothing updated (previous data kept)")
     cols = _columns(rows)
     key_cols, ignore = _split(cfg["keys"]()), set(_split(cfg["ignore"]()))
     internal = {c for k, c in cols.items() if k.startswith("_")}
@@ -130,132 +135,146 @@ def upsert_report(table, rows):
     if missing:
         raise RuntimeError(f"{src}: key fields not in report: {missing}")
 
-    staged = {}
+    staged = []
     for r in rows:
         d = {cols[k]: _text(v) for k, v in r.items()}
         key = "|".join(d.get(k) or "" for k in key_cols)
-        if not key.strip("|"):
-            raise RuntimeError(f"{src}: row with empty key {key_cols}: {d}")
         h = json.dumps({k: v for k, v in d.items() if k not in ignore and k not in internal},
                        sort_keys=True)
-        staged[key] = (hashlib.sha1(h.encode()).hexdigest(), d)
-    duplicates = len(rows) - len(staged)
+        staged.append((key, hashlib.sha1(h.encode()).hexdigest(), json.dumps(d)))
+    duplicates = len(staged) - len({k for k, _, _ in staged})
 
     names = ", ".join(f'"{c}"' for c in cols.values())
-    exprs = ", ".join(f"data->>'{c}'" for c in cols.values())
-    sets = ", ".join(f'"{c}" = EXCLUDED."{c}"' for c in cols.values())
+    exprs = ", ".join(f"s.data->>'{c}'" for c in cols.values())
     inv, cust, status, due = cfg["log"]
-    o, n = "to_jsonb(u)", "s.data"
-    stage = f"{table}_stage"
+    stage, prev = f"{table}_stage", f"{table}_prev"
+    log = ("INSERT INTO report_changes (source, row_key, change, invoice_number, customer_id, "
+           "old_status, new_status, old_amount_due, new_amount_due) ")
 
     with connect() as c, c.transaction():
         c.execute(SCHEMA)
+        # views depend on the table; drop them, they are recreated at the end
+        c.execute(f"DROP VIEW IF EXISTS ar_invoices_v, {table}_v")
+        c.execute(f"DROP INDEX IF EXISTS {table}_row_key")  # older versions: unique key
+        c.execute(f"ALTER TABLE {table} DROP COLUMN IF EXISTS closed_at")
+        c.execute(f"CREATE INDEX IF NOT EXISTS {table}_row_key_ix ON {table} (row_key)")
         for col in cols.values():
             c.execute(f'ALTER TABLE {table} ADD COLUMN IF NOT EXISTS "{col}" TEXT')
-        c.execute(f"DELETE FROM {table} WHERE row_key IS NULL")  # rows from the old full-refresh loads
-        c.execute(f"CREATE UNIQUE INDEX IF NOT EXISTS {table}_row_key ON {table} (row_key)")
-        first_load = not c.execute(f"SELECT EXISTS (SELECT 1 FROM {table})").fetchone()[0]
 
-        c.execute(f"CREATE TEMP TABLE {stage} (row_key TEXT PRIMARY KEY, row_hash TEXT, data JSONB) "
-                  "ON COMMIT DROP")
+        c.execute(f"CREATE TEMP TABLE {stage} (row_key TEXT, row_hash TEXT, data JSONB) ON COMMIT DROP")
         with c.cursor() as cur:
-            cur.executemany(f"INSERT INTO {stage} VALUES (%s, %s, %s)",
-                            [(k, h, json.dumps(d)) for k, (h, d) in staged.items()])
+            cur.executemany(f"INSERT INTO {stage} VALUES (%s, %s, %s)", staged)
+        # previous state, one row per key
+        c.execute(f"""CREATE TEMP TABLE {prev} ON COMMIT DROP AS
+                      SELECT DISTINCT ON (row_key) row_key, row_hash, first_seen, to_jsonb(t) AS data
+                      FROM {table} t WHERE row_key IS NOT NULL ORDER BY row_key, id""")
+        first_load = not c.execute(f"SELECT EXISTS (SELECT 1 FROM {prev})").fetchone()[0]
 
-        # 1) new / changed / reopened (not logged on the very first load)
         if not first_load:
-            c.execute(f"""
-                INSERT INTO report_changes (source, row_key, change, invoice_number, customer_id,
-                                            old_status, new_status, old_amount_due, new_amount_due)
-                SELECT %s, s.row_key,
-                       CASE WHEN u.row_key IS NULL THEN 'new'
-                            WHEN u.closed_at IS NOT NULL THEN 'reopened' ELSE 'changed' END,
-                       {n}->>'{inv}', {n}->>'{cust}', {o}->>'{status}', {n}->>'{status}',
-                       {o}->>'{due}', {n}->>'{due}'
-                FROM {stage} s LEFT JOIN {table} u USING (row_key)
-                WHERE u.row_key IS NULL OR u.closed_at IS NOT NULL
-                   OR u.row_hash IS DISTINCT FROM s.row_hash""", (src,))
-        # 2) stored as current, but no longer in the report
-        gone = f"u.closed_at IS NULL AND NOT EXISTS (SELECT 1 FROM {stage} s WHERE s.row_key = u.row_key)"
+            newk = f"(SELECT DISTINCT ON (row_key) * FROM {stage} ORDER BY row_key)"
+            # new + changed
+            c.execute(log + f"""
+                SELECT %s, s.row_key, CASE WHEN p.row_key IS NULL THEN 'new' ELSE 'changed' END,
+                       s.data->>'{inv}', s.data->>'{cust}', p.data->>'{status}', s.data->>'{status}',
+                       p.data->>'{due}', s.data->>'{due}'
+                FROM {newk} s LEFT JOIN {prev} p USING (row_key)
+                WHERE p.row_key IS NULL OR p.row_hash IS DISTINCT FROM s.row_hash""", (src,))
+            # removed (workday) / closed (ubw): stored before, not in the report any more
+            c.execute(log + f"""
+                SELECT %s, p.row_key, %s, p.data->>'{inv}', p.data->>'{cust}', p.data->>'{status}', NULL,
+                       p.data->>'{due}', NULL
+                FROM {prev} p WHERE NOT EXISTS (SELECT 1 FROM {stage} s WHERE s.row_key = p.row_key)""",
+                      (src, cfg["gone"]))
+
+        # replace: the table is now exactly the latest report
+        c.execute(f"DELETE FROM {table}")
         c.execute(f"""
-            INSERT INTO report_changes (source, row_key, change, invoice_number, customer_id,
-                                        old_status, old_amount_due)
-            SELECT %s, u.row_key, %s, {o}->>'{inv}', {o}->>'{cust}', {o}->>'{status}', {o}->>'{due}'
-            FROM {table} u WHERE {gone}""", (src, cfg["gone"]))
-        c.execute(f"UPDATE {table} u SET closed_at = now() WHERE {gone}")
-        # 3) upsert: one row per row_key
-        c.execute(f"""
-            INSERT INTO {table} (row_key, row_hash, first_seen, loaded_at, closed_at, {names})
-            SELECT row_key, row_hash, now(), now(), NULL, {exprs} FROM {stage}
-            ON CONFLICT (row_key) DO UPDATE SET
-                row_hash = EXCLUDED.row_hash, loaded_at = now(), closed_at = NULL, {sets}""")
+            INSERT INTO {table} (row_key, row_hash, first_seen, loaded_at, {names})
+            SELECT s.row_key, s.row_hash, coalesce(p.first_seen, now()), now(), {exprs}
+            FROM {stage} s LEFT JOIN {prev} p USING (row_key)""")
 
         stats = dict(c.execute("SELECT change, count(*) FROM report_changes "
                                "WHERE source = %s AND changed_at = now() GROUP BY change", (src,)).fetchall())
-        _views(c, table)
+        _views(c)
     return {"rows": len(staged), "duplicates": duplicates, "first_load": first_load,
-            **{k: stats.get(k, 0) for k in ("new", "changed", cfg["gone"], "reopened")}}
+            **{k: stats.get(k, 0) for k in ("new", "changed", cfg["gone"])}}
 
 
-def _views(c, table):
-    """(Re)create the typed views; a view failure is logged, it doesn't fail the load."""
-    sql = {"wdar": WDAR_VIEW, "ubwar": UBWAR_VIEW}[table]
-    for name, stmt in ((f"{table}_v", sql), ("ar_invoices_v", AR_VIEW)):
-        if name == "ar_invoices_v" and not c.execute(
-                "SELECT to_regclass('wdar_v') IS NOT NULL AND to_regclass('ubwar_v') IS NOT NULL"
-        ).fetchone()[0]:
+def _views(c):
+    """(Re)create the typed views from the columns that exist; a failure is logged only."""
+    for name, build in (("wdar_v", _wdar_view), ("ubwar_v", _ubwar_view)):
+        have = {r[0] for r in c.execute(
+            "SELECT column_name FROM information_schema.columns WHERE table_name = %s",
+            (name[:-2],))}
+        if "row_key" not in have:
             continue
         try:
             with c.transaction():
-                c.execute(stmt)
+                c.execute(f"DROP VIEW IF EXISTS ar_invoices_v, {name}")
+                c.execute(f"CREATE VIEW {name} AS SELECT " + build(have) + f" FROM {name[:-2]}")
         except Exception as e:
             print(f"view {name} not created: {e}", flush=True)
+    if c.execute("SELECT to_regclass('wdar_v') IS NOT NULL AND to_regclass('ubwar_v') IS NOT NULL").fetchone()[0]:
+        c.execute("CREATE OR REPLACE VIEW ar_invoices_v AS SELECT 'workday' AS source, * FROM wdar_v "
+                  "UNION ALL SELECT 'ubw' AS source, * FROM ubwar_v")
 
 
-def _num(c, alias=None):
-    return (f"CASE WHEN replace({c}, ',', '') ~ '^-?[0-9]+(\\.[0-9]+)?$' "
-            f"THEN replace({c}, ',', '')::numeric(18,2) END AS {alias or c}")
+_NUM_RE = "'^-?[0-9]+(\\.[0-9]+)?([eE][-+]?[0-9]+)?$'"
 
 
-def _date(c, alias=None):
+def _num(c):
+    return f"CASE WHEN replace({c}, ',', '') ~ {_NUM_RE} THEN replace({c}, ',', '')::numeric(18,2) END"
+
+
+def _date(c):
     return (f"CASE WHEN {c} ~ '^\\d{{4}}-\\d{{2}}-\\d{{2}}' THEN left({c}, 10)::date "
-            f"WHEN {c} ~ '^\\d{{2}}/\\d{{2}}/\\d{{4}}$' THEN to_date({c}, 'MM/DD/YYYY') END "
-            f"AS {alias or c}")
+            f"WHEN {c} ~ '^\\d{{2}}/\\d{{2}}/\\d{{4}}$' THEN to_date({c}, 'MM/DD/YYYY') END")
 
 
-# Typed view for Power BI: amounts -> numeric, dates -> date, everything else as-is.
-# Only rows currently in the Workday report (history stays in wdar / report_changes).
-WDAR_VIEW = "CREATE OR REPLACE VIEW wdar_v AS SELECT " + ", ".join([
-    "id", "loaded_at", "company", "customer_id", "customer_name", "customer_contracts_group",
-    "invoice_number", "referenceid", "po_number", "memo", "currency",
-    "invoice_status", "payment_status", "payment_terms",
-    _date("invoice_date"), _date("due_date"),
-    _num("invoice_amount"), _num("inv_amount_usd"), _num("amount_due_lc"), _num("amount_due_usd"),
-]) + " FROM wdar WHERE closed_at IS NULL"  # rows Workday no longer returns are kept but hidden
+def _select(have, spec):
+    """spec: [(alias, source column, kind)] -> select list; missing columns become typed NULLs."""
+    out = []
+    for alias, col, kind in spec:
+        if col not in have:
+            out.append(f"NULL::{ {'num': 'numeric(18,2)', 'date': 'date'}.get(kind, 'text') } AS {alias}")
+        elif kind == "num":
+            out.append(f"{_num(col)} AS {alias}")
+        elif kind == "date":
+            out.append(f"{_date(col)} AS {alias}")
+        else:
+            out.append(f"{col} AS {alias}")
+    return ", ".join(out)
 
-# UBW (template 792, customer transactions) in the same shape as wdar_v.
-# Fields UBW doesn't have are NULL. Amounts are in invoice currency (cur_amount / rest_curr).
-# Rows that dropped out of the (open-items) report are 'Closed' with 0 due.
-UBWAR_VIEW = "CREATE OR REPLACE VIEW ubwar_v AS SELECT " + ", ".join([
-    "id", "loaded_at", "client AS company", "apar_id AS customer_id",
-    "NULL::text AS customer_name", "NULL::text AS customer_contracts_group",
-    "ext_inv_ref AS invoice_number", "voucher_no AS referenceid",
-    "NULL::text AS po_number", "NULL::text AS memo", "currency",
-    "voucher_type AS invoice_status",
-    "CASE WHEN closed_at IS NOT NULL THEN 'Closed' "
-    "WHEN rest_curr ~ '^-?0+(\\.0+)?$' THEN 'Paid' "
-    "WHEN rest_curr = cur_amount THEN 'Unpaid' ELSE 'Partially Paid' END AS payment_status",
-    "NULL::text AS payment_terms",
-    _date("voucher_date", "invoice_date"), _date("due_date"),
-    _num("cur_amount", "invoice_amount"), "NULL::numeric(18,2) AS inv_amount_usd",
-    "CASE WHEN closed_at IS NOT NULL THEN 0::numeric(18,2) ELSE "
-    + _num("rest_curr", "x").rsplit(" AS ", 1)[0] + " END AS amount_due_lc",
-    "NULL::numeric(18,2) AS amount_due_usd",
-]) + " FROM ubwar"
 
-# One AR view for Power BI: Workday + UBW, same columns, plus source.
-AR_VIEW = ("CREATE OR REPLACE VIEW ar_invoices_v AS "
-           "SELECT 'workday' AS source, * FROM wdar_v UNION ALL SELECT 'ubw' AS source, * FROM ubwar_v")
+# Power BI columns (same for both sources): (name, kind)
+_AR_COLS = [("company", "text"), ("customer_id", "text"), ("customer_name", "text"),
+            ("customer_contracts_group", "text"), ("invoice_number", "text"), ("referenceid", "text"),
+            ("po_number", "text"), ("memo", "text"), ("currency", "text"), ("invoice_status", "text"),
+            ("payment_status", "text"), ("payment_terms", "text"), ("invoice_date", "date"),
+            ("due_date", "date"), ("invoice_amount", "num"), ("inv_amount_usd", "num"),
+            ("amount_due_lc", "num"), ("amount_due_usd", "num")]
+
+
+def _wdar_view(have):
+    return "id, loaded_at, first_seen, " + _select(have, [(n, n, k) for n, k in _AR_COLS])
+
+
+# UBW column for each Power BI column (None = UBW has no equivalent).
+_UBW_MAP = {"company": "client", "customer_id": "apar_id", "invoice_number": "ext_inv_ref",
+            "referenceid": "voucher_no", "memo": "description", "currency": "currency",
+            "invoice_status": "voucher_type", "invoice_date": "voucher_date", "due_date": "due_date",
+            "invoice_amount": "cur_amount", "amount_due_lc": "rest_curr"}
+
+
+def _ubwar_view(have):
+    spec = [(n, _UBW_MAP.get(n, "-"), k) for n, k in _AR_COLS]
+    sel = _select(have, spec)
+    if {"rest_curr", "cur_amount"} <= have:  # derived from the open amount
+        sel = sel.replace("NULL::text AS payment_status",
+                          f"CASE WHEN {_num('rest_curr')} = 0 THEN 'Paid' "
+                          f"WHEN {_num('rest_curr')} = {_num('cur_amount')} THEN 'Unpaid' "
+                          "ELSE 'Partially Paid' END AS payment_status")
+    return "id, loaded_at, first_seen, " + sel
 
 
 def connect():
