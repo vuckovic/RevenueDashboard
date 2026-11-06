@@ -11,6 +11,8 @@ config.local.*
 *.xlsx
 *.csv
 data/
+dist/
+*.dump
 
 # OS / editor / Python
 .DS_Store

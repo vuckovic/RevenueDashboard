@@ -1,0 +1,179 @@
+{% raw %}<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Cash-flow forecast</title>
+<style>
+ :root{--bg:#f6f7f9;--card:#fff;--ink:#1d2330;--muted:#667085;--line:#e4e7ec;--c0:#e8590c;--c1:#1971c2;--warn:#b54708}
+ *{box-sizing:border-box}
+ body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif}
+ header{display:flex;flex-wrap:wrap;gap:1rem;align-items:center;justify-content:space-between;padding:1rem 1.5rem;background:var(--card);border-bottom:1px solid var(--line)}
+ header h1{font-size:1.25rem;margin:0}
+ header .sub{color:var(--muted);font-size:.85rem}
+ main{max-width:1440px;margin:0 auto;padding:1.25rem 1rem 3rem}
+ .controls{display:flex;flex-wrap:wrap;gap:1.25rem;align-items:center}
+ .controls label{display:flex;gap:.5rem;align-items:center;color:var(--muted)}
+ .controls output{font-weight:600;color:var(--ink);min-width:5.5em}
+ input[type=range]{width:180px}
+ a{color:var(--c1)}
+ .grid{display:grid;gap:1rem}
+ .kpis{grid-template-columns:repeat(auto-fit,minmax(230px,1fr))}
+ .card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:1rem 1.1rem}
+ .card h2{font-size:1rem;margin:0 0 .75rem}
+ .kpi .name{display:flex;align-items:center;gap:.5rem;font-weight:600}
+ .dot{width:10px;height:10px;border-radius:50%;display:inline-block}
+ .kpi dl{display:grid;grid-template-columns:1fr auto;gap:.3rem .75rem;margin:.75rem 0 0}
+ .kpi dt{color:var(--muted)}.kpi dd{margin:0;text-align:right;font-variant-numeric:tabular-nums;font-weight:600}
+ .kpi dd.big{font-size:1.35rem}
+ .warn{color:var(--warn)}
+ section{margin-top:1rem}
+ .legend{display:flex;gap:1rem;flex-wrap:wrap;color:var(--muted);font-size:.85rem;margin-bottom:.5rem}
+ #chart svg{width:100%;height:auto;display:block}
+ #chart .tick{fill:var(--muted);font-size:11px}
+ #chart .gl{stroke:var(--line)}
+ .tip{position:fixed;pointer-events:none;background:#1d2330;color:#fff;padding:.45rem .6rem;border-radius:6px;font-size:.8rem;opacity:0;transition:opacity .1s;white-space:nowrap}
+ .two{grid-template-columns:repeat(auto-fit,minmax(380px,1fr))}
+ table{width:100%;border-collapse:collapse;font-size:.85rem}
+ th,td{padding:.4rem .5rem;border-bottom:1px solid var(--line);text-align:left}
+ th{color:var(--muted);font-weight:500}
+ td.n,th.n{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+ tfoot td{font-weight:700;border-top:2px solid var(--line)}
+ .empty{color:var(--muted);padding:1rem 0}
+ .note{color:var(--muted);font-size:.8rem;margin-top:1rem}
+ @media (max-width:520px){.two{grid-template-columns:1fr}header{padding:1rem}}
+</style></head><body>
+<header>
+ <div><h1>Cash-flow forecast</h1><div class="sub" id="sub">Loading…</div></div>
+ <div class="controls">
+  <label>Next <input type="range" id="n" min="1" max="24" value="12"><output id="nOut">12 months</output></label>
+  <label><input type="checkbox" id="od" checked> Count overdue in current month</label>
+  <a href="/">← Sync status</a>
+ </div>
+</header>
+<main>
+ <div class="grid kpis" id="kpis"></div>
+ <section class="card"><h2 id="chartTitle">Expected income per month</h2><div class="legend" id="legend"></div><div id="chart"></div><p class="note" id="chartNote"></p></section>
+ <section class="grid two" id="next"></section>
+ <section class="card"><h2 id="yeTitle">Estimate to end of year</h2><div id="ye"></div></section>
+ <p class="note" id="note"></p>
+</main>
+<div class="tip" id="tip"></div>
+<script>
+const $ = id => document.getElementById(id);
+const eur = v => new Intl.NumberFormat('en-IE',{style:'currency',currency:'EUR',maximumFractionDigits:0}).format(v);
+const num = v => new Intl.NumberFormat('en-IE',{maximumFractionDigits:2,minimumFractionDigits:2}).format(v);
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const COLORS = ['var(--c0)','var(--c1)','#2f9e44','#9c36b5'];
+const MON = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+let D;
+
+const ym = s => s.slice(0,7);                                  // "2026-11-04" -> "2026-11"
+function months(start, n){ const [y,m]=start.split('-').map(Number); const out=[];
+  for(let i=0;i<n;i++){ const d=new Date(Date.UTC(y,m-1+i,1)); out.push(d.toISOString().slice(0,7)); } return out; }
+const label = k => MON[+k.slice(5)-1] + ' ' + k.slice(0,4);
+
+// month an item is expected in (null = not counted)
+function bucket(it){
+  if (it.due_date >= D.today) return ym(it.due_date);
+  return $('od').checked ? ym(D.today) : null;               // overdue
+}
+function sums(keys){
+  const s = {}; D.companies.forEach(c => s[c] = Object.fromEntries(keys.map(k => [k,0])));
+  for (const it of D.items){ const b = bucket(it); if (b && s[it.company] && b in s[it.company]) s[it.company][b] += it.amount_eur; }
+  return s;
+}
+
+function render(){
+  const n = +$('n').value; $('nOut').textContent = n + (n===1?' month':' months');
+  const cur = ym(D.today), keys = months(cur, n);
+  const yeKeys = months(cur, 12 - (+cur.slice(5)) + 1);
+  const s = sums(keys), ye = sums(yeKeys);
+  const color = c => COLORS[D.companies.indexOf(c) % COLORS.length];
+
+  // KPIs
+  $('kpis').innerHTML = D.companies.map(c => {
+    const od = D.items.filter(i => i.company===c && i.due_date < D.today);
+    const tot = Object.values(s[c]).reduce((a,b)=>a+b,0), yet = Object.values(ye[c]).reduce((a,b)=>a+b,0);
+    return `<div class="card kpi"><div class="name"><span class="dot" style="background:${color(c)}"></span>${esc(c)}</div><dl>
+      <dt>Next ${n} month${n>1?'s':''}</dt><dd class="big">${eur(tot)}</dd>
+      <dt>Until 31 Dec ${cur.slice(0,4)}</dt><dd>${eur(yet)}</dd>
+      <dt>Overdue (${od.length})</dt><dd class="${od.length?'warn':''}">${eur(od.reduce((a,i)=>a+i.amount_eur,0))}</dd></dl></div>`;
+  }).join('') + (() => { const all = D.companies.reduce((a,c)=>a+Object.values(s[c]).reduce((x,y)=>x+y,0),0);
+    const ally = D.companies.reduce((a,c)=>a+Object.values(ye[c]).reduce((x,y)=>x+y,0),0);
+    return `<div class="card kpi"><div class="name">Total</div><dl><dt>Next ${n} month${n>1?'s':''}</dt><dd class="big">${eur(all)}</dd>
+      <dt>Until 31 Dec ${cur.slice(0,4)}</dt><dd>${eur(ally)}</dd><dt>Open invoices</dt><dd>${D.items.length}</dd></dl></div>`; })();
+
+  // Chart
+  $('chartTitle').textContent = `Expected income per month — next ${n} month${n>1?'s':''} (EUR)`;
+  $('legend').innerHTML = D.companies.map(c => `<span><span class="dot" style="background:${color(c)}"></span> ${esc(c)}</span>`).join('');
+  chart(keys, D.companies.map(c => ({name:c, color:color(c), vals: keys.map(k => s[c][k])})));
+  // explain zero months: only issued (open) invoices are counted
+  const last = D.items.reduce((m,i) => i.due_date > m ? i.due_date : m, '');
+  $('chartNote').textContent = !D.items.length
+    ? 'No open invoices with an EUR rate — check FX_TO_EUR in .env (see note at the bottom).'
+    : ym(last) < keys[keys.length-1]
+      ? `Latest due date of an open invoice: ${last}. Months after ${label(ym(last))} show 0 because those invoices haven't been issued yet.`
+      : '';
+
+  // Next 10 per company
+  $('next').innerHTML = D.companies.map(c => {
+    const rows = D.items.filter(i => i.company===c && i.due_date >= D.today)
+      .sort((a,b) => a.due_date.localeCompare(b.due_date) || b.amount_eur-a.amount_eur).slice(0,10);
+    return `<div class="card"><h2><span class="dot" style="background:${color(c)}"></span> ${esc(c)} — next 10 expected payments</h2>` +
+      (rows.length ? `<table><thead><tr><th>Due</th><th>Customer</th><th>Invoice</th><th class="n">Amount</th><th class="n">EUR</th></tr></thead><tbody>` +
+        rows.map(r => `<tr><td>${r.due_date}</td><td>${esc(r.customer)}</td><td>${esc(r.invoice)}</td>
+          <td class="n">${num(r.amount)} ${esc(r.currency)}</td><td class="n">${eur(r.amount_eur)}</td></tr>`).join('') + `</tbody></table>`
+       : `<div class="empty">No upcoming payments.</div>`) + `</div>`;
+  }).join('');
+
+  // Year-end table
+  $('yeTitle').textContent = `Estimate to end of year (${label(cur)} – Dec ${cur.slice(0,4)}, EUR)`;
+  const tot = k => D.companies.reduce((a,c)=>a+ye[c][k],0);
+  $('ye').innerHTML = `<table><thead><tr><th>Month</th>${D.companies.map(c=>`<th class="n">${esc(c)}</th>`).join('')}<th class="n">Total</th></tr></thead><tbody>` +
+    yeKeys.map(k => `<tr><td>${label(k)}</td>${D.companies.map(c=>`<td class="n">${eur(ye[c][k])}</td>`).join('')}<td class="n">${eur(tot(k))}</td></tr>`).join('') +
+    `</tbody><tfoot><tr><td>Total</td>${D.companies.map(c=>`<td class="n">${eur(yeKeys.reduce((a,k)=>a+ye[c][k],0))}</td>`).join('')}<td class="n">${eur(yeKeys.reduce((a,k)=>a+tot(k),0))}</td></tr></tfoot></table>`;
+}
+
+function chart(keys, series){
+  const W=1100,H=340,L=70,R=16,T=14,B=34, w=W-L-R, h=H-T-B;
+  const max = Math.max(1, ...series.flatMap(s=>s.vals));
+  const step = niceStep(max/4), top = Math.ceil(max/step)*step;
+  const x = i => L + (keys.length===1 ? w/2 : i*w/(keys.length-1));
+  const y = v => T + h - v/top*h;
+  const short = v => v>=1e6 ? (v/1e6).toFixed(v%1e6?1:0)+'M' : v>=1e3 ? Math.round(v/1e3)+'k' : v;
+  let g = '';
+  for (let v=0; v<=top+1e-9; v+=step) g += `<line class="gl" x1="${L}" x2="${W-R}" y1="${y(v)}" y2="${y(v)}"/><text class="tick" x="${L-8}" y="${y(v)+4}" text-anchor="end">€${short(v)}</text>`;
+  const every = Math.ceil(keys.length/12);
+  keys.forEach((k,i) => { if (i%every===0) g += `<text class="tick" x="${x(i)}" y="${H-12}" text-anchor="middle">${label(k)}</text>`; });
+  series.forEach(s => {
+    g += `<polyline fill="none" stroke="${s.color}" stroke-width="2.5" stroke-linejoin="round" points="${s.vals.map((v,i)=>x(i)+','+y(v)).join(' ')}"/>`;
+    s.vals.forEach((v,i) => g += `<circle cx="${x(i)}" cy="${y(v)}" r="3.5" fill="${s.color}"/>`);
+  });
+  keys.forEach((k,i) => { const bw = keys.length===1 ? w : w/(keys.length-1);
+    g += `<rect x="${x(i)-bw/2}" y="${T}" width="${bw}" height="${h}" fill="transparent" data-i="${i}"/>`; });
+  $('chart').innerHTML = `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Expected income per month">${g}</svg>`;
+  const tip = $('tip');
+  $('chart').querySelectorAll('rect').forEach(r => {
+    r.onmousemove = e => { const i=+r.dataset.i;
+      tip.innerHTML = `<b>${label(keys[i])}</b><br>` + series.map(s=>`${esc(s.name)}: ${eur(s.vals[i])}`).join('<br>');
+      tip.style.left = Math.min(e.clientX+12, innerWidth-200)+'px'; tip.style.top = (e.clientY+12)+'px'; tip.style.opacity = 1; };
+    r.onmouseleave = () => tip.style.opacity = 0;
+  });
+}
+function niceStep(raw){ const p = Math.pow(10, Math.floor(Math.log10(raw||1))); const f = raw/p;
+  return (f<=1?1:f<=2?2:f<=2.5?2.5:f<=5?5:10)*p; }
+
+function start(data){
+  D = data;
+  if (!D.companies.length) D.companies = [...new Set(D.items.map(i=>i.company))];
+  $('sub').textContent = `As of ${D.today} · ${D.items.length} open invoices · expected payment = due date · amounts in EUR (fixed rates)`;
+  const sk = Object.entries(D.skipped||{});
+  $('note').innerHTML = 'FX to EUR: ' + Object.entries(D.fx||{}).map(([k,v])=>`${esc(k)} ${v}`).join(', ') +
+    (sk.length ? ` · <span class="warn">Not included: ${sk.map(([k,v])=>`${v} × ${esc(k)}`).join(', ')}</span>` : '');
+  render();
+}
+$('n').oninput = render; $('od').onchange = render;
+if (window.CASHFLOW_DATA) start(window.CASHFLOW_DATA);
+else fetch('/api/cashflow').then(r => { if(!r.ok) throw new Error(r.status); return r.json(); }).then(start)
+  .catch(e => $('sub').innerHTML = `<span class="warn">Could not load data (${esc(e.message)}).</span>`);
+</script>
+</body></html>
+{% endraw %}

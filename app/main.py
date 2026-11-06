@@ -5,6 +5,7 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
 
+import cashflow
 import db
 import excel
 import sync
@@ -30,6 +31,16 @@ def home(request: Request):
         "runs": db.recent_runs(),
         "sources": sync.enabled_sources(),
     })
+
+
+@app.get("/cashflow", response_class=HTMLResponse)
+def cashflow_page(request: Request):
+    return templates.TemplateResponse(request, "cashflow.html", {})
+
+
+@app.get("/api/cashflow")
+def cashflow_data():
+    return cashflow.forecast()
 
 
 @app.get("/api/invoices")

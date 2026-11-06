@@ -317,6 +317,21 @@ def recent_runs(limit=20):
         return [dict(zip(cols, r)) for r in cur]
 
 
+def open_items():
+    """Open AR rows (amount due > 0) from wdar_v and ubwar_v, whichever exist."""
+    cols = ("invoice_number, referenceid, customer_id, customer_name, currency, payment_status, "
+            "due_date, amount_due_lc, amount_due_usd")
+    with connect() as c:
+        parts = [f"SELECT '{src}' AS source, {cols} FROM {view} WHERE amount_due_lc > 0"
+                 for src, view in (("workday", "wdar_v"), ("ubw", "ubwar_v"))
+                 if c.execute("SELECT to_regclass(%s) IS NOT NULL", (view,)).fetchone()[0]]
+        if not parts:
+            return []
+        cur = c.execute(" UNION ALL ".join(parts) + " ORDER BY due_date NULLS LAST")
+        names = [d.name for d in cur.description]
+        return [dict(zip(names, r)) for r in cur]
+
+
 def counts():
     with connect() as c:
         return dict(c.execute("SELECT source, count(*) FROM invoices GROUP BY source").fetchall())

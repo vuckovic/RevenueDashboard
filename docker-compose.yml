@@ -19,6 +19,7 @@ services:
 
   web:
     build: ./app
+    image: revenuedashboard-app:latest
     restart: unless-stopped
     env_file: .env
     environment:
@@ -31,6 +32,7 @@ services:
 
   worker:
     build: ./app
+    image: revenuedashboard-app:latest
     restart: unless-stopped
     env_file: .env
     environment:
